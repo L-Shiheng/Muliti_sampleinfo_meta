@@ -49,7 +49,7 @@ except ImportError:
     pass
 
 # ==========================================
-# 1. 辅助函数
+# 1. 绘图与统计函数 (保持不变)
 # ==========================================
 def update_layout_square(fig, title="", x_title="", y_title="", width=600, height=600):
     fig.update_layout(template="simple_white", width=width, height=height, title={'text': title, 'y':0.95, 'x':0.5, 'xanchor': 'center'}, xaxis=dict(title=x_title, showline=True, linewidth=2, mirror=True), yaxis=dict(title=y_title, showline=True, linewidth=2, mirror=True), legend=dict(yanchor="top", y=1, xanchor="left", x=1.15), margin=dict(l=80, r=180, t=80, b=80))
@@ -104,79 +104,64 @@ if 'qc_report' not in st.session_state: st.session_state.qc_report = {}
 if 'all_sample_ids' not in st.session_state: st.session_state.all_sample_ids = []
 
 # ==========================================
-# 3. 侧边栏 (Sidebar) - 重构版
+# 3. 侧边栏 (Robust UI)
 # ==========================================
 with st.sidebar:
     st.header("🛠️ 数据控制台")
     
-    # 调试开关
-    show_debug = st.checkbox("🔧 显示调试信息", value=False)
-
     # --- 1. Info 上传 ---
     st.markdown("#### 1. 上传 Sample Info (必选)")
     sample_info_file = st.file_uploader("Info表格 (.csv/.xlsx)", type=["csv", "xlsx"], key="info")
     info_df = None
     candidate_samples = []
     
-    # 关键变量初始化
+    # 关键：初始化变量
     user_sample_col = None
     user_group_col = None
     
     if sample_info_file:
         try:
+            sample_info_file.seek(0) # 双保险
             if sample_info_file.name.endswith('.csv'): info_df = pd.read_csv(sample_info_file)
             else: info_df = pd.read_excel(sample_info_file)
             
-            # --- 智能列名映射 ---
+            # 列名智能映射
             cols = list(info_df.columns)
             cols_lower = [c.lower() for c in cols]
             
-            # 1. 找样本名列
             idx_sample = 0
             for kw in ['sample.name', 'sample_name', 'sample', 'name', 'id']:
                 if kw in cols_lower: idx_sample = cols_lower.index(kw); break
             
-            # 2. 找分组列 (Group)
             idx_group = 1 if len(cols) > 1 else 0
             for kw in ['group', 'class', 'type', 'condition']:
                 if kw in cols_lower: idx_group = cols_lower.index(kw); break
             
-            # 强制让用户确认 (防止自动识别错误)
+            # 显式选择框
             c1, c2 = st.columns(2)
-            user_sample_col = c1.selectbox("样本列", cols, index=idx_sample, help="Sample ID")
-            user_group_col = c2.selectbox("分组列", cols, index=idx_group, help="Group / Class")
+            user_sample_col = c1.selectbox("样本名列", cols, index=idx_sample)
+            user_group_col = c2.selectbox("分组列", cols, index=idx_group)
 
-            # 立即获取样本列表 (只要读到 Info 表，这里就会有值)
             if user_sample_col:
                 candidate_samples = info_df[user_sample_col].astype(str).unique().tolist()
-            
-            if show_debug:
-                st.write("Info预览:", info_df.head(2))
-                st.write("候选样本:", candidate_samples[:3])
                 
+            st.caption(f"✅ 已加载 {len(info_df)} 行样本信息")
+            
         except Exception as e: st.error(f"Info 读取失败: {e}")
 
-    # 回退逻辑: 如果还没传 Info，但之前运行过，用之前的缓存
     if not candidate_samples and st.session_state.all_sample_ids:
         candidate_samples = st.session_state.all_sample_ids
 
-    # --- 2. 样本剔除 (现在应该始终显示) ---
+    # --- 2. 剔除 ---
     st.markdown("#### 2. 样本剔除 (黑名单)")
-    excluded_samples = st.multiselect(
-        "选择要剔除的样本:",
-        options=candidate_samples,
-        default=[],
-        placeholder="请先上传 Info 表...",
-        help="不管名字里有点(.)还是横杠(-)，只要选中都会被强制删除。"
-    )
-    if excluded_samples:
-        st.error(f"⚠️ 已加入黑名单: {len(excluded_samples)} 个")
+    excluded_samples = st.multiselect("选择要剔除的样本:", options=candidate_samples, default=[])
+    if excluded_samples: st.error(f"⚠️ 已剔除 {len(excluded_samples)} 个样本")
 
-    # --- 3. 处理范围 ---
+    # --- 3. 范围 ---
     st.markdown("#### 3. 数据范围")
     feature_scope = st.radio("特征范围:", ["仅已注释特征 (推荐)", "全部特征"], index=0)
 
-    # --- 4. SERRF (可选) ---
+    # --- 4. SERRF ---
     st.markdown("#### 4. SERRF 校正")
     use_serrf = st.checkbox("启用 SERRF", value=False)
     serrf_ready = False
@@ -184,21 +169,16 @@ with st.sidebar:
     if use_serrf:
         if info_df is not None:
             cols = list(info_df.columns); cols_lower = [c.lower() for c in cols]
-            # 找 Order
             idx_order = next((i for i, c in enumerate(cols_lower) if any(x in c for x in ['order', 'run', 'idx', 'seq'])), 0)
-            # 找 Type (QC列)
-            type_cands = [i for i, c in enumerate(cols_lower) if any(x in c for x in ['class', 'type', 'group'])]
-            final_type_idx = type_cands[0] if type_cands else 0
             
-            # 优先检查 Group 列内容是否含 QC
+            # Type列逻辑：优先检查分组列是否含有QC
+            final_type_idx = 0
             if user_group_col and info_df[user_group_col].astype(str).str.contains('QC', case=False).any():
                 final_type_idx = cols.index(user_group_col)
             else:
-                # 否则遍历查找
-                for idx in type_cands:
-                    if info_df[cols[idx]].astype(str).str.contains('qc', case=False).any(): final_type_idx = idx; break
+                type_cands = [i for i, c in enumerate(cols_lower) if any(x in c for x in ['class', 'type', 'group'])]
+                if type_cands: final_type_idx = type_cands[0]
             
-            # 找 QC 标签
             default_qc_label = "QC"
             try:
                 vals = info_df.iloc[:, final_type_idx].unique().astype(str)
@@ -213,7 +193,7 @@ with st.sidebar:
         else:
             st.warning("⚠️ 需上传 Info 表")
 
-    # --- 5. 数据上传 ---
+    # --- 5. 上传 ---
     st.markdown("#### 5. 上传 MetDNA 数据")
     uploaded_files = st.file_uploader("结果文件 (支持多选)", type=["csv", "xlsx"], accept_multiple_files=True, key="data")
     st.markdown("---")
@@ -225,7 +205,7 @@ with st.sidebar:
     process_container.markdown('</div>', unsafe_allow_html=True)
 
 # ====================
-# 主处理逻辑
+# 主处理流程
 # ====================
 if start_process:
     st.session_state.qc_report = {}
@@ -244,16 +224,16 @@ if start_process:
                     file_type = 'csv' if file.name.endswith('.csv') else 'excel'
                     unique_name = f"{os.path.splitext(file.name)[0]}_{i+1}{os.path.splitext(file.name)[1]}"
                     
+                    # 1. 解析数据
                     df_t, meta, err = parse_metdna_file(file, unique_name, file_type=file_type)
                     if err: st.warning(f"{file.name}: {err}"); continue
                     
-                    # === 强力剔除 (Fingerprint Match) ===
+                    # 2. 强力剔除 (Fingerprint Match)
                     if excluded_samples:
                         n_before = len(df_t)
                         def get_fingerprint(s): return re.sub(r'[^a-z0-9]', '', str(s).strip().lower())
                         ex_fingerprints = set([get_fingerprint(s) for s in excluded_samples])
                         
-                        # 计算数据指纹
                         data_fingerprints = df_t['SampleID'].astype(str).apply(get_fingerprint)
                         mask_remove = data_fingerprints.isin(ex_fingerprints)
                         df_t = df_t[~mask_remove]
@@ -264,7 +244,7 @@ if start_process:
                     
                     current_run_samples.update(df_t['SampleID'].astype(str).tolist())
 
-                    # Filter Scope
+                    # 3. Scope过滤
                     if feature_scope.startswith("仅已注释"):
                         annotated_ids = meta[meta['Is_Annotated'] == True].index
                         cols_to_keep = ['SampleID', 'Group', 'Source_Files'] + [c for c in df_t.columns if c in annotated_ids]
@@ -272,22 +252,25 @@ if start_process:
                         df_t = df_t[cols_to_keep]
                         meta = meta.loc[meta.index.isin(df_t.columns)]
                         
-                    # === 分组信息匹配 (核心修复) ===
+                    # 4. 分组信息对齐 (Robust Logic)
                     info_aligned = None
                     if info_df is not None:
-                        # 1. 优先使用侧边栏选定的 Sample 列
+                        # 4a. 匹配样本
                         target_col = user_sample_col if user_sample_col else None
                         info_aligned = align_sample_info(df_t, info_df, sample_col_name=target_col)
                         
-                        # 2. 优先使用侧边栏选定的 Group 列覆盖
+                        # 4b. 覆盖分组 (三级回退逻辑)
                         if user_group_col and user_group_col in info_aligned.columns:
-                            df_t['Group'] = info_aligned[user_group_col].fillna(df_t['Group']).values
+                            # Level 1: 用户指定列
+                            new_groups = info_aligned[user_group_col].fillna(df_t['Group']).values
+                            df_t['Group'] = new_groups
                         elif info_aligned is not None:
-                            # 自动回退
+                            # Level 2: 自动寻找 'Group', 'Class'
                             g_col = next((c for c in info_aligned.columns if c.lower() in ['group', 'class']), None)
-                            if g_col: df_t['Group'] = info_aligned[g_col].fillna(df_t['Group']).values
+                            if g_col: 
+                                df_t['Group'] = info_aligned[g_col].fillna(df_t['Group']).values
                     
-                    # SERRF
+                    # 5. SERRF
                     if use_serrf and serrf_ready and info_aligned is not None:
                         n_matched = info_aligned[run_order_col].notna().sum()
                         if n_matched == 0:
@@ -329,10 +312,56 @@ if start_process:
                 
                 st.session_state.data_loaded = True
                 st.success("✅ 处理完成！")
+                
+                # 诊断信息：帮助您确认分组是否真的对了
+                with st.expander("🔍 检查数据匹配详情 (Debug)", expanded=True):
+                    preview = st.session_state.raw_df[['SampleID', 'Group']].head()
+                    st.write("最终数据预览 (前5行):", preview)
+                    unique_grps = st.session_state.raw_df['Group'].unique()
+                    st.write(f"识别到的分组 ({len(unique_grps)}个):", unique_grps)
+                
+                # 给一点时间看完提示再刷新
+                import time
+                time.sleep(2)
                 st.rerun() 
             else: st.error("加载失败")
 
-# Main
+# Export
+if st.session_state.data_loaded and st.session_state.raw_df is not None:
+    raw_df = st.session_state.raw_df
+    st.info(f"数据: {len(raw_df)} 样本 x {len(raw_df.columns)-3} 特征")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    csv_data = raw_df.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 导出数据", csv_data, f"Metabo_{ts}.csv", "text/csv")
+    st.divider()
+
+    with st.form(key='analysis_form'):
+        st.markdown("### ⚙️ 统计分析")
+        non_num = raw_df.select_dtypes(exclude=[np.number]).columns.tolist()
+        def_grp = non_num.index('Group') if 'Group' in non_num else 0
+        group_col = st.selectbox("分组列", non_num, index=def_grp)
+        
+        filter_option = st.radio("分析范围:", ["全部特征", "仅已注释特征"], index=0)
+        
+        with st.expander("清洗配置", expanded=False):
+            miss_th = st.slider("剔除缺失 > X", 0.0, 1.0, 0.5)
+            impute_m_disp = st.selectbox("填充", ["min (推荐)", "KNN", "mean", "zero"], index=0)
+            impute_m = "KNN" if "KNN" in impute_m_disp else ("mean" if "mean" in impute_m_disp else ("zero" if "zero" in impute_m_disp else "min"))
+            norm_m = st.selectbox("归一化", ["None", "PQN", "Sum", "Median"], index=1)
+            do_log = st.checkbox("Log2", value=True); scale_m = st.selectbox("缩放", ["None", "Auto", "Pareto"], index=2)
+
+        cur_grps = sorted(raw_df[group_col].astype(str).unique())
+        sel_grps = st.multiselect("纳入组", cur_grps, default=cur_grps[:2] if len(cur_grps)>=2 else cur_grps)
+        c1, c2 = st.columns(2)
+        valid = list(sel_grps)
+        case = c1.selectbox("Case", valid, index=0 if valid else None)
+        ctrl = c2.selectbox("Control", valid, index=1 if len(valid)>1 else 0)
+        c3, c4 = st.columns(2)
+        p_th = c3.number_input("P-value", 0.05); fc_th = c4.number_input("Log2 FC", 1.0)
+        equal_var = st.checkbox("Equal Var", value=True); jitter = st.checkbox("Jitter", value=True)
+        submit_button = st.form_submit_button(label='🚀 运行')
+
+# Result
 if not st.session_state.data_loaded:
     st.title("🧬 MetaboAnalyst Pro"); st.info("👈 请在左侧上传数据"); st.stop()
 
@@ -349,7 +378,7 @@ if not submit_button:
     st.dataframe(st.session_state.raw_df.head(50)); st.stop()
 
 if submit_button:
-    if len(selected_groups)<2: st.error("请选2组"); st.stop()
+    if len(sel_grps)<2: st.error("请选2组"); st.stop()
     with st.spinner("计算中..."):
         raw_df = st.session_state.raw_df; meta = st.session_state.feature_meta
         df_proc, feats = data_cleaning_pipeline(raw_df, group_col, miss_th, impute_m, norm_m, do_log, scale_m)
@@ -360,7 +389,7 @@ if submit_button:
                 if not feats: st.error("无特征"); st.stop()
             else: st.warning("无Meta")
         
-        df_sub = df_proc[df_proc[group_col].isin(selected_groups)].copy()
+        df_sub = df_proc[df_proc[group_col].isin(sel_grps)].copy()
         
         if case != ctrl:
             stats_df = run_pairwise_statistics(df_sub, group_col, case, ctrl, feats, equal_var)
