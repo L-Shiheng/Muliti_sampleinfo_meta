@@ -14,7 +14,10 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import KNNImputer
 from statsmodels.stats.multitest import multipletests
+from joblib import Parallel, delayed
 
 # ==========================================
 # 0. 基础配置
@@ -37,19 +40,324 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 导入检查
-try:
-    from data_preprocessing import data_cleaning_pipeline, parse_metdna_file, merge_multiple_dfs, apply_sample_info, align_sample_info
-except ImportError:
-    st.error("❌ 严重错误：未找到 'data_preprocessing.py'。请确保文件在同一目录下。")
-    st.stop()
-try:
-    from serrf_module import serrf_normalization
-except ImportError:
-    pass
+# ==========================================
+# 1. 核心模块：数据处理 (原 data_preprocessing.py)
+# ==========================================
+def make_unique(series):
+    """处理重名ID"""
+    seen = set()
+    result = []
+    for item in series:
+        new_item = item
+        counter = 1
+        while new_item in seen:
+            new_item = f"{item}_{counter}"
+            counter += 1
+        seen.add(new_item)
+        result.append(new_item)
+    return result
+
+def parse_metdna_file(file_buffer, file_name, file_type='csv'):
+    """解析 MetDNA 导出文件"""
+    try:
+        if file_type == 'csv':
+            try:
+                df = pd.read_csv(file_buffer, engine='pyarrow')
+            except:
+                file_buffer.seek(0)
+                df = pd.read_csv(file_buffer)
+        else:
+            df = pd.read_excel(file_buffer)
+    except Exception as e:
+        return None, None, f"读取失败: {str(e)}"
+
+    # 1. 智能识别样本列
+    known_meta_cols = {
+        'peak_name', 'mz', 'rt', 'id', 'id_zhulab', 'name', 'formula', 
+        'confidence_level', 'smiles', 'inchikey', 'isotope', 'adduct', 
+        'total_score', 'mz_error', 'rt_error_abs', 'rt_error_rela', 
+        'ms2_score', 'iden_score', 'iden_type', 'peak_group_id', 
+        'base_peak', 'num_peaks', 'cons_formula_pred', 'id_kegg', 
+        'id_hmdb', 'id_metacyc', 'stereo_isomer_id', 'stereo_isomer_name'
+    }
+    
+    potential_cols = [c for c in df.columns if c not in known_meta_cols]
+    sample_cols = []
+    if potential_cols:
+        subset = df[potential_cols].head(5)
+        is_numeric = subset.apply(lambda x: pd.to_numeric(x, errors='coerce').notna().all())
+        sample_cols = is_numeric[is_numeric].index.tolist()
+            
+    if not sample_cols:
+        return None, None, "未找到样本数据列。"
+
+    # 2. 构建元数据
+    file_tag = os.path.splitext(os.path.basename(file_name))[0]
+    clean_tag = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', file_tag)
+    
+    if 'name' not in df.columns: df['name'] = ""
+    if 'confidence_level' not in df.columns: df['confidence_level'] = 'Unknown'
+    
+    df['name'] = df['name'].fillna("").astype(str)
+    mask_annotated = (df['name'] != "") & (df['name'].str.lower() != "nan")
+    clean_names = df['name'].str.split(';', expand=True)[0]
+    
+    mz_str = df['mz'].map('{:.4f}'.format).astype(str) if 'mz' in df.columns else ""
+    rt_str = df['rt'].map('{:.2f}'.format).astype(str) if 'rt' in df.columns else ""
+    unannotated_ids = "m/z" + mz_str + "_RT" + rt_str + "_" + clean_tag
+    
+    final_ids = np.where(mask_annotated, clean_names + "_" + clean_tag, unannotated_ids)
+    final_ids = make_unique(final_ids)
+
+    meta_df = pd.DataFrame({
+        "Metabolite_ID": final_ids,
+        "Original_Name": df['name'],
+        "Clean_Name": np.where(mask_annotated, clean_names, final_ids),
+        "Confidence_Level": df['confidence_level'],
+        "Is_Annotated": mask_annotated,
+        "Source_File": clean_tag
+    })
+    meta_df.set_index('Metabolite_ID', inplace=True)
+    
+    # 3. 提取数据
+    df_data = df[sample_cols].copy()
+    df_data.index = meta_df.index
+    df_transposed = df_data.T
+    
+    df_transposed.reset_index(inplace=True)
+    df_transposed.rename(columns={'index': 'SampleID'}, inplace=True)
+    df_transposed['Source_Files'] = clean_tag
+    df_transposed['Group'] = df_transposed['SampleID'].astype(str).str.extract(r'([^\d]+)')[0].str.strip('._-').fillna("Unknown")
+    
+    return df_transposed, meta_df, None
+
+def merge_multiple_dfs(results_list):
+    """合并多文件"""
+    if not results_list: return None, None, "无数据"
+    
+    best_features = {}
+    sample_source_map = {}
+    
+    for file_idx, (df, meta, fname) in enumerate(results_list):
+        if 'SampleID' in df.columns and 'Source_Files' in df.columns:
+            current_tag = df['Source_Files'].iloc[0]
+            for sid in df['SampleID']:
+                if sid not in sample_source_map: sample_source_map[sid] = set()
+                sample_source_map[sid].add(current_tag)
+        
+        numeric_df = df.select_dtypes(include=[np.number])
+        intensities = numeric_df.sum(axis=0)
+        
+        for feat_id in numeric_df.columns:
+            try:
+                clean_name = meta.loc[feat_id, 'Clean_Name']
+            except KeyError: continue
+            curr_score = intensities.get(feat_id, 0)
+            if clean_name not in best_features:
+                best_features[clean_name] = (file_idx, feat_id, curr_score)
+            else:
+                prev_idx, prev_id, prev_score = best_features[clean_name]
+                if curr_score > prev_score:
+                    best_features[clean_name] = (file_idx, feat_id, curr_score)
+    
+    files_features_to_keep = {i: [] for i in range(len(results_list))}
+    for c_name, (f_idx, f_id, score) in best_features.items():
+        files_features_to_keep[f_idx].append(f_id)
+        
+    dfs_to_concat = []
+    base_group_series = None
+    
+    for i, (df, meta, fname) in enumerate(results_list):
+        if 'SampleID' in df.columns: df = df.set_index('SampleID')
+        cols_to_drop = [c for c in ['Group', 'Source_Files'] if c in df.columns]
+        if 'Group' in df.columns and base_group_series is None:
+            base_group_series = df['Group']
+        df_clean = df.drop(columns=cols_to_drop, errors='ignore')
+        cols_to_keep = files_features_to_keep[i]
+        valid_cols = [c for c in cols_to_keep if c in df_clean.columns]
+        dfs_to_concat.append(df_clean[valid_cols])
+        
+    try:
+        full_df = pd.concat(dfs_to_concat, axis=1, join='outer')
+    except Exception as e:
+        return None, None, f"合并出错: {str(e)}"
+    
+    full_df.fillna(0, inplace=True)
+    if base_group_series is not None:
+        aligned_group = base_group_series.reindex(full_df.index).fillna('Unknown')
+        full_df.insert(0, 'Group', aligned_group)
+    else:
+        full_df.insert(0, 'Group', 'Unknown')
+        
+    full_df.reset_index(inplace=True)
+    full_df.rename(columns={'index': 'SampleID'}, inplace=True)
+    
+    def get_combined_source(sid):
+        sources = sample_source_map.get(sid, set())
+        return "; ".join(sorted(list(sources)))
+    full_df['Source_Files'] = full_df['SampleID'].apply(get_combined_source)
+    
+    final_ids = [fid for f_list in files_features_to_keep.values() for fid in f_list]
+    all_meta = pd.concat([res[1] for res in results_list])
+    merged_meta = all_meta.loc[final_ids]
+    
+    return full_df, merged_meta, None
+
+def align_sample_info(data_df, info_df, sample_col_name=None):
+    """对齐样本信息"""
+    target_col = None
+    if sample_col_name and sample_col_name in info_df.columns:
+        target_col = sample_col_name
+    else:
+        cols_lower = [c.lower() for c in info_df.columns]
+        candidates = ['sample', 'sampleid', 'sample.name', 'name', 'id']
+        for cand in candidates:
+            if cand in cols_lower:
+                target_col = info_df.columns[cols_lower.index(cand)]
+                break
+        if not target_col: target_col = info_df.columns[0]
+        
+    def normalize(s): return re.sub(r'[^a-zA-Z0-9]', '', str(s)).lower()
+    
+    info_map = {}
+    for idx, row in info_df.iterrows():
+        key = normalize(row[target_col])
+        info_map[key] = row
+        
+    aligned_data = []
+    for sid in data_df['SampleID']:
+        key = normalize(sid)
+        if key in info_map: aligned_data.append(info_map[key])
+        else: aligned_data.append(pd.Series([np.nan]*len(info_df.columns), index=info_df.columns))
+            
+    aligned_df = pd.DataFrame(aligned_data)
+    aligned_df.index = data_df.index 
+    return aligned_df
+
+def pqn_normalization(df):
+    """PQN Normalization"""
+    reference = df.median(axis=0)
+    reference[reference <= 0] = 1e-6
+    quotients = df.div(reference, axis=1)
+    dilution_factors = quotients.median(axis=1)
+    return df.div(dilution_factors, axis=0)
+
+def data_cleaning_pipeline(df, group_col, missing_thresh=0.5, impute_method='min', 
+                           norm_method='None', log_transform=True, scale_method='None'):
+    """清洗与归一化管道"""
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    exclude_cols = [group_col, 'SampleID', 'Source_Files']
+    numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
+    
+    meta_cols = [c for c in df.columns if c not in numeric_cols]
+    data_df = df[numeric_cols].copy()
+    meta_df = df[meta_cols].copy()
+    
+    # 1. Filter
+    missing_ratio = data_df.isnull().mean()
+    cols_to_keep = missing_ratio[missing_ratio <= missing_thresh].index
+    data_df = data_df[cols_to_keep]
+    
+    # 2. Impute
+    if data_df.isnull().sum().sum() > 0:
+        if impute_method == 'min': data_df = data_df.fillna(data_df.min() * 0.5)
+        elif impute_method == 'mean': data_df = data_df.fillna(data_df.mean())
+        elif impute_method == 'median': data_df = data_df.fillna(data_df.median())
+        elif impute_method == 'KNN':
+            imputer = KNNImputer(n_neighbors=5)
+            filled_vals = imputer.fit_transform(data_df)
+            data_df = pd.DataFrame(filled_vals, columns=data_df.columns, index=data_df.index)
+        elif impute_method == 'zero': data_df = data_df.fillna(0)
+        data_df = data_df.fillna(0)
+
+    # 3. Norm
+    if norm_method == 'Sum':
+        data_df = data_df.div(data_df.sum(axis=1), axis=0) * data_df.sum(axis=1).mean()
+    elif norm_method == 'Median':
+        data_df = data_df.div(data_df.median(axis=1), axis=0) * data_df.median(axis=1).mean()
+    elif norm_method == 'PQN':
+        data_df = pqn_normalization(data_df)
+
+    # 4. Log
+    if log_transform:
+        if (data_df <= 0).any().any(): data_df = np.log2(data_df + 1)
+        else: data_df = np.log2(data_df)
+
+    # 5. Scale
+    if scale_method != 'None':
+        mean = data_df.mean()
+        std = data_df.std()
+        if scale_method == 'Auto': data_df = (data_df - mean) / std
+        elif scale_method == 'Pareto': data_df = (data_df - mean) / np.sqrt(std)
+
+    # 6. Var
+    var_mask = data_df.var() > 1e-9
+    data_df = data_df.loc[:, var_mask]
+    
+    return pd.concat([meta_df, data_df], axis=1), data_df.columns.tolist()
 
 # ==========================================
-# 1. 绘图与统计函数 (保持不变)
+# 2. 核心模块：SERRF (原 serrf_module.py)
+# ==========================================
+def serrf_normalization(df_data, df_meta, run_order_col, sample_type_col, qc_label, n_trees=100):
+    """SERRF: 100 Trees, Log-Space, Robust"""
+    common_idx = df_data.index.intersection(df_meta.index)
+    if len(common_idx) < len(df_data): return None, "索引不匹配"
+    
+    X_raw = df_data.loc[common_idx].copy()
+    meta = df_meta.loc[common_idx].copy()
+    
+    try:
+        meta[run_order_col] = pd.to_numeric(meta[run_order_col], errors='coerce')
+        valid = meta[run_order_col].notna()
+        X_raw = X_raw[valid]
+        meta = meta[valid]
+    except: return None, "Order列包含非数字"
+    
+    qc_mask = meta[sample_type_col] == qc_label
+    if qc_mask.sum() < 3: return None, f"QC样本不足 ({qc_mask.sum()}<3)"
+
+    run_orders = meta[[run_order_col]].values
+    
+    def process_metabolite(y_all, is_qc, run_orders):
+        valid_val = (y_all > 0) & (~np.isnan(y_all))
+        valid_qc = is_qc & valid_val
+        if valid_qc.sum() < 3: return y_all
+        
+        y_qc = y_all[valid_qc]
+        X_qc = run_orders[valid_qc]
+        y_qc_log = np.log1p(y_qc)
+        
+        rf = RandomForestRegressor(n_estimators=n_trees, min_samples_leaf=3, max_features='sqrt', random_state=42, n_jobs=1)
+        rf.fit(X_qc, y_qc_log)
+        
+        y_pred = np.expm1(rf.predict(run_orders))
+        qc_target = np.median(y_qc)
+        min_pred = qc_target * 0.1
+        y_pred = np.maximum(y_pred, min_pred)
+        
+        return y_all * (qc_target / y_pred)
+
+    results = Parallel(n_jobs=4, backend='threading')(
+        delayed(process_metabolite)(X_raw[col].values, qc_mask.values, run_orders)
+        for col in X_raw.columns
+    )
+    
+    df_corrected = pd.DataFrame(np.array(results).T, index=X_raw.index, columns=X_raw.columns)
+    
+    def get_rsd(df, mask):
+        qc = df.loc[mask]
+        qc = qc.loc[:, (qc != 0).any(axis=0)]
+        if qc.shape[1] == 0: return 0.0
+        return (qc.std() / qc.mean() * 100).median()
+    
+    return df_corrected, {
+        "RSD_Before": get_rsd(X_raw, qc_mask), 
+        "RSD_After": get_rsd(df_corrected, qc_mask)
+    }
+
+# ==========================================
+# 3. 绘图与统计函数
 # ==========================================
 def update_layout_square(fig, title="", x_title="", y_title="", width=600, height=600):
     fig.update_layout(template="simple_white", width=width, height=height, title={'text': title, 'y':0.95, 'x':0.5, 'xanchor': 'center'}, xaxis=dict(title=x_title, showline=True, linewidth=2, mirror=True), yaxis=dict(title=y_title, showline=True, linewidth=2, mirror=True), legend=dict(yanchor="top", y=1, xanchor="left", x=1.15), margin=dict(l=80, r=180, t=80, b=80))
@@ -95,7 +403,7 @@ def run_pairwise_statistics(df, group_col, case, control, features, equal_var=Fa
     return res_df
 
 # ==========================================
-# 2. Session State
+# 4. Session State & Sidebar
 # ==========================================
 if 'raw_df' not in st.session_state: st.session_state.raw_df = None
 if 'feature_meta' not in st.session_state: st.session_state.feature_meta = None
@@ -103,31 +411,26 @@ if 'data_loaded' not in st.session_state: st.session_state.data_loaded = False
 if 'qc_report' not in st.session_state: st.session_state.qc_report = {}
 if 'all_sample_ids' not in st.session_state: st.session_state.all_sample_ids = []
 
-# ==========================================
-# 3. 侧边栏 (Robust UI)
-# ==========================================
 with st.sidebar:
     st.header("🛠️ 数据控制台")
     
-    # --- 1. Info 上传 ---
+    # 1. Info
     st.markdown("#### 1. 上传 Sample Info (必选)")
     sample_info_file = st.file_uploader("Info表格 (.csv/.xlsx)", type=["csv", "xlsx"], key="info")
     info_df = None
     candidate_samples = []
     
-    # 关键：初始化变量
     user_sample_col = None
     user_group_col = None
     
     if sample_info_file:
         try:
-            sample_info_file.seek(0) # 双保险
+            sample_info_file.seek(0)
             if sample_info_file.name.endswith('.csv'): info_df = pd.read_csv(sample_info_file)
             else: info_df = pd.read_excel(sample_info_file)
             
-            # 列名智能映射
-            cols = list(info_df.columns)
-            cols_lower = [c.lower() for c in cols]
+            # 智能映射
+            cols = list(info_df.columns); cols_lower = [c.lower() for c in cols]
             
             idx_sample = 0
             for kw in ['sample.name', 'sample_name', 'sample', 'name', 'id']:
@@ -137,31 +440,29 @@ with st.sidebar:
             for kw in ['group', 'class', 'type', 'condition']:
                 if kw in cols_lower: idx_group = cols_lower.index(kw); break
             
-            # 显式选择框
             c1, c2 = st.columns(2)
-            user_sample_col = c1.selectbox("样本名列", cols, index=idx_sample)
+            user_sample_col = c1.selectbox("样本列", cols, index=idx_sample)
             user_group_col = c2.selectbox("分组列", cols, index=idx_group)
 
             if user_sample_col:
                 candidate_samples = info_df[user_sample_col].astype(str).unique().tolist()
                 
-            st.caption(f"✅ 已加载 {len(info_df)} 行样本信息")
-            
+            st.caption(f"✅ 已加载 {len(info_df)} 行")
         except Exception as e: st.error(f"Info 读取失败: {e}")
 
     if not candidate_samples and st.session_state.all_sample_ids:
         candidate_samples = st.session_state.all_sample_ids
 
-    # --- 2. 剔除 ---
+    # 2. 剔除
     st.markdown("#### 2. 样本剔除 (黑名单)")
     excluded_samples = st.multiselect("选择要剔除的样本:", options=candidate_samples, default=[])
     if excluded_samples: st.error(f"⚠️ 已剔除 {len(excluded_samples)} 个样本")
 
-    # --- 3. 范围 ---
+    # 3. 范围
     st.markdown("#### 3. 数据范围")
     feature_scope = st.radio("特征范围:", ["仅已注释特征 (推荐)", "全部特征"], index=0)
 
-    # --- 4. SERRF ---
+    # 4. SERRF
     st.markdown("#### 4. SERRF 校正")
     use_serrf = st.checkbox("启用 SERRF", value=False)
     serrf_ready = False
@@ -171,7 +472,6 @@ with st.sidebar:
             cols = list(info_df.columns); cols_lower = [c.lower() for c in cols]
             idx_order = next((i for i, c in enumerate(cols_lower) if any(x in c for x in ['order', 'run', 'idx', 'seq'])), 0)
             
-            # Type列逻辑：优先检查分组列是否含有QC
             final_type_idx = 0
             if user_group_col and info_df[user_group_col].astype(str).str.contains('QC', case=False).any():
                 final_type_idx = cols.index(user_group_col)
@@ -193,20 +493,20 @@ with st.sidebar:
         else:
             st.warning("⚠️ 需上传 Info 表")
 
-    # --- 5. 上传 ---
+    # 5. 上传
     st.markdown("#### 5. 上传 MetDNA 数据")
     uploaded_files = st.file_uploader("结果文件 (支持多选)", type=["csv", "xlsx"], accept_multiple_files=True, key="data")
     st.markdown("---")
     
-    # --- 6. 运行 ---
+    # 6. 运行
     process_container = st.container()
     process_container.markdown('<div class="process-btn">', unsafe_allow_html=True)
     start_process = process_container.button("📥 开始处理数据")
     process_container.markdown('</div>', unsafe_allow_html=True)
 
-# ====================
-# 主处理流程
-# ====================
+# ==========================================
+# 5. 主处理逻辑
+# ==========================================
 if start_process:
     st.session_state.qc_report = {}
     if not uploaded_files:
@@ -224,27 +524,24 @@ if start_process:
                     file_type = 'csv' if file.name.endswith('.csv') else 'excel'
                     unique_name = f"{os.path.splitext(file.name)[0]}_{i+1}{os.path.splitext(file.name)[1]}"
                     
-                    # 1. 解析数据
+                    # 1. 解析
                     df_t, meta, err = parse_metdna_file(file, unique_name, file_type=file_type)
                     if err: st.warning(f"{file.name}: {err}"); continue
                     
-                    # 2. 强力剔除 (Fingerprint Match)
+                    # 2. 剔除
                     if excluded_samples:
                         n_before = len(df_t)
                         def get_fingerprint(s): return re.sub(r'[^a-z0-9]', '', str(s).strip().lower())
                         ex_fingerprints = set([get_fingerprint(s) for s in excluded_samples])
-                        
                         data_fingerprints = df_t['SampleID'].astype(str).apply(get_fingerprint)
                         mask_remove = data_fingerprints.isin(ex_fingerprints)
                         df_t = df_t[~mask_remove]
-                        
                         n_after = len(df_t)
-                        if n_before > n_after:
-                            st.success(f"✅ {unique_name}: 已剔除 {n_before - n_after} 个样本")
+                        if n_before > n_after: st.success(f"✅ {unique_name}: 已剔除 {n_before - n_after} 个样本")
                     
                     current_run_samples.update(df_t['SampleID'].astype(str).tolist())
 
-                    # 3. Scope过滤
+                    # 3. Scope
                     if feature_scope.startswith("仅已注释"):
                         annotated_ids = meta[meta['Is_Annotated'] == True].index
                         cols_to_keep = ['SampleID', 'Group', 'Source_Files'] + [c for c in df_t.columns if c in annotated_ids]
@@ -252,23 +549,17 @@ if start_process:
                         df_t = df_t[cols_to_keep]
                         meta = meta.loc[meta.index.isin(df_t.columns)]
                         
-                    # 4. 分组信息对齐 (Robust Logic)
+                    # 4. Info对齐
                     info_aligned = None
                     if info_df is not None:
-                        # 4a. 匹配样本
                         target_col = user_sample_col if user_sample_col else None
                         info_aligned = align_sample_info(df_t, info_df, sample_col_name=target_col)
                         
-                        # 4b. 覆盖分组 (三级回退逻辑)
                         if user_group_col and user_group_col in info_aligned.columns:
-                            # Level 1: 用户指定列
-                            new_groups = info_aligned[user_group_col].fillna(df_t['Group']).values
-                            df_t['Group'] = new_groups
+                            df_t['Group'] = info_aligned[user_group_col].fillna(df_t['Group']).values
                         elif info_aligned is not None:
-                            # Level 2: 自动寻找 'Group', 'Class'
                             g_col = next((c for c in info_aligned.columns if c.lower() in ['group', 'class']), None)
-                            if g_col: 
-                                df_t['Group'] = info_aligned[g_col].fillna(df_t['Group']).values
+                            if g_col: df_t['Group'] = info_aligned[g_col].fillna(df_t['Group']).values
                     
                     # 5. SERRF
                     if use_serrf and serrf_ready and info_aligned is not None:
@@ -312,17 +603,6 @@ if start_process:
                 
                 st.session_state.data_loaded = True
                 st.success("✅ 处理完成！")
-                
-                # 诊断信息：帮助您确认分组是否真的对了
-                with st.expander("🔍 检查数据匹配详情 (Debug)", expanded=True):
-                    preview = st.session_state.raw_df[['SampleID', 'Group']].head()
-                    st.write("最终数据预览 (前5行):", preview)
-                    unique_grps = st.session_state.raw_df['Group'].unique()
-                    st.write(f"识别到的分组 ({len(unique_grps)}个):", unique_grps)
-                
-                # 给一点时间看完提示再刷新
-                import time
-                time.sleep(2)
                 st.rerun() 
             else: st.error("加载失败")
 
@@ -340,7 +620,6 @@ if st.session_state.data_loaded and st.session_state.raw_df is not None:
         non_num = raw_df.select_dtypes(exclude=[np.number]).columns.tolist()
         def_grp = non_num.index('Group') if 'Group' in non_num else 0
         group_col = st.selectbox("分组列", non_num, index=def_grp)
-        
         filter_option = st.radio("分析范围:", ["全部特征", "仅已注释特征"], index=0)
         
         with st.expander("清洗配置", expanded=False):
