@@ -8,5 +8,6 @@ matplotlib
 statsmodels
 pyarrow
 seaborn
-
+openpyxl
+joblib
 
